@@ -1,4 +1,5 @@
-module github.com/bifurcation/mint
+module github.com/michellejns/mint
+
 
 go 1.16
 
