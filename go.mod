@@ -1,6 +1,5 @@
 module github.com/michellejns/mint
 
-
 go 1.16
 
 require (
