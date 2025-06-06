@@ -9,6 +9,15 @@ import (
 	"time"
 )
 
+type TLSVersion uint16
+
+const (
+	TLS10 TLSVersion = 0x0301
+	TLS11 TLSVersion = 0x0302
+	TLS12 TLSVersion = 0x0303
+	TLS13 TLSVersion = 0x0304
+)
+
 // Server returns a new TLS server side connection
 // using conn as the underlying transport.
 // The configuration config must be non-nil and must include

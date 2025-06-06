@@ -2,6 +2,7 @@ package mint
 
 import (
 	"crypto/x509"
+	"fmt"
 	"time"
 )
 
@@ -87,6 +88,21 @@ func (hc *HandshakeContext) SetVersion(version uint16) {
 	}
 }
 
+// Getter Funktion für Queue und SendHandshakeMessage
+func (hc *HandshakeContext) Out() *HandshakeLayer {
+	return hc.hOut
+}
+
+// SendHandshakeMessageFromBody erzeugt eine TLS-Handshake-Nachricht aus dem Body,
+// queued sie und sendet sie anschließend.
+func (hc *HandshakeContext) SendHandshakeMessageFromBody(body HandshakeMessageBody) (HandshakeAction, error) {
+	msg, err := hc.Out().HandshakeMessageFromBody(body)
+	if err != nil {
+		return nil, fmt.Errorf("could not marshal handshake message: %w", err)
+	}
+	return QueueHandshakeMessage{msg}, nil
+}
+
 // stateConnected is symmetric between client and server
 type stateConnected struct {
 	Params              ConnectionParameters
@@ -138,6 +154,14 @@ func (state *stateConnected) KeyUpdate(request KeyUpdateRequest) ([]HandshakeAct
 
 func (state *stateConnected) NewSessionTicket(length int, lifetime, earlyDataLifetime uint32) ([]HandshakeAction, Alert) {
 	tkt, err := NewSessionTicket(length, lifetime)
+	fmt.Printf("DEBUG: NewSessionTicket wird erstellt:\n")
+	fmt.Printf("  Ticket: %x\n", tkt.Ticket)
+	fmt.Printf("  TicketNonce: %x\n", tkt.TicketNonce)
+	fmt.Printf("  Lifetime: %d\n", tkt.TicketLifetime)
+	fmt.Printf("  AllowEarlyData: %v\n", tkt.AllowEarlyData)
+	fmt.Printf("  EarlyDataLifetime: %d\n", tkt.EarlyDataLifetime)
+	fmt.Printf("  Extensions: %+v\n", tkt.Extensions)
+
 	if err != nil {
 		logf(logTypeHandshake, "[StateConnected] Error generating NewSessionTicket: %v", err)
 		return nil, AlertInternalError
@@ -153,14 +177,16 @@ func (state *stateConnected) NewSessionTicket(length int, lifetime, earlyDataLif
 		labelResumption, tkt.TicketNonce, state.cryptoParams.Hash.Size())
 
 	newPSK := PreSharedKey{
-		CipherSuite:  state.cryptoParams.Suite,
-		IsResumption: true,
-		Identity:     tkt.Ticket,
-		Key:          resumptionKey,
-		NextProto:    state.Params.NextProto,
-		ReceivedAt:   time.Now(),
-		ExpiresAt:    time.Now().Add(time.Duration(tkt.TicketLifetime) * time.Second),
-		TicketAgeAdd: tkt.TicketAgeAdd,
+		CipherSuite:       state.cryptoParams.Suite,
+		IsResumption:      true,
+		Identity:          tkt.Ticket,
+		Key:               resumptionKey,
+		NextProto:         state.Params.NextProto,
+		ReceivedAt:        time.Now(),
+		ExpiresAt:         time.Now().Add(time.Duration(tkt.TicketLifetime) * time.Second),
+		TicketAgeAdd:      tkt.TicketAgeAdd,
+		//AllowEarlyData:    tkt.AllowEarlyData,
+		//EarlyDataLifetime: tkt.EarlyDataLifetime,
 	}
 
 	tktm, err := state.hsCtx.hOut.HandshakeMessageFromBody(tkt)
@@ -221,22 +247,38 @@ func (state stateConnected) ProcessMessage(hm *HandshakeMessage) (HandshakeState
 		return state, toSend, AlertNoAlert
 	case *NewSessionTicketBody:
 		// XXX: Allow NewSessionTicket in both directions?
+		fmt.Println("DEBUG: client verarbeitet NewSessionTicketBody")
+
 		if !state.isClient {
 			return nil, nil, AlertUnexpectedMessage
 		}
 
 		resumptionKey := HkdfExpandLabel(state.cryptoParams.Hash, state.resumptionSecret,
 			labelResumption, body.TicketNonce, state.cryptoParams.Hash.Size())
-		psk := PreSharedKey{
-			CipherSuite:  state.cryptoParams.Suite,
-			IsResumption: true,
-			Identity:     body.Ticket,
-			Key:          resumptionKey,
-			NextProto:    state.Params.NextProto,
-			ReceivedAt:   time.Now(),
-			ExpiresAt:    time.Now().Add(time.Duration(body.TicketLifetime) * time.Second),
-			TicketAgeAdd: body.TicketAgeAdd,
+		ticketLifetime := body.TicketLifetime
+		if ticketLifetime == 0 {
+			ticketLifetime = 600 // Fallback, wenn TicketLifetime nicht mitgesendet wurde
 		}
+		ticketLifetime = body.TicketLifetime
+		if ticketLifetime == 0 {
+			logf(logTypeHandshake, "⚠️ TicketLifetime war 0, setze auf 600 Sekunden (Fallback)")
+			ticketLifetime = 600
+		}
+
+		psk := PreSharedKey{
+			CipherSuite:       state.cryptoParams.Suite,
+			IsResumption:      true,
+			Identity:          body.Ticket,
+			Key:               resumptionKey,
+			NextProto:         state.Params.NextProto,
+			ReceivedAt:        time.Now(),
+			ExpiresAt:         time.Now().Add(time.Duration(int64(ticketLifetime)) * time.Second),
+			TicketAgeAdd:      body.TicketAgeAdd,
+			//AllowEarlyData:    body.AllowEarlyData,
+			//EarlyDataLifetime: body.EarlyDataLifetime,
+		}
+
+		fmt.Printf("🎫 TicketLifetime im Ticket: %v Sekunden", body.TicketLifetime)
 
 		toSend := []HandshakeAction{StorePSK{psk}}
 		return state, toSend, AlertNoAlert

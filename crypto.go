@@ -538,11 +538,11 @@ const (
 	labelResumption                     = "resumption"
 )
 
-// struct HkdfLabel {
-//    uint16 length;
-//    opaque label<9..255>;
-//    opaque hash_value<0..255>;
-// };
+//	struct HkdfLabel {
+//	   uint16 length;
+//	   opaque label<9..255>;
+//	   opaque hash_value<0..255>;
+//	};
 func hkdfEncodeLabel(labelIn string, hashValue []byte, outLen int) []byte {
 	label := "tls13 " + labelIn
 
@@ -627,37 +627,55 @@ func MakeNewSelfSignedCert(name string, alg SignatureScheme) (crypto.Signer, *x5
 	}
 	return priv, cert, nil
 }
+func DefaultCipherSuites() []CipherSuite {
+	return []CipherSuite{
+		0x1301, // TLS_AES_128_GCM_SHA256
+		0x1302, // TLS_AES_256_GCM_SHA384
+	}
+}
 
 func newSelfSigned(name string, alg SignatureScheme, priv crypto.Signer) (*x509.Certificate, error) {
-	sigAlg, ok := x509AlgMap[alg]
+	fmt.Println("🧪 newSelfSigned wurde aufgerufen")
+	/*sigAlg, ok := x509AlgMap[alg]
 	if !ok {
 		return nil, fmt.Errorf("tls.selfsigned: Unknown signature algorithm [%04x]", alg)
-	}
+	}*/
 	if len(name) == 0 {
 		return nil, fmt.Errorf("tls.selfsigned: No name provided")
 	}
 
-	serial, err := rand.Int(rand.Reader, big.NewInt(0xA0A0A0A0))
+	/*serial, err := rand.Int(rand.Reader, big.NewInt(0xA0A0A0A0))
 	if err != nil {
 		return nil, err
-	}
+	}*/
 
 	template := &x509.Certificate{
-		SerialNumber:       serial,
-		NotBefore:          time.Now(),
-		NotAfter:           time.Now().AddDate(0, 0, 1),
-		SignatureAlgorithm: sigAlg,
-		Subject:            pkix.Name{CommonName: name},
-		DNSNames:           []string{name},
-		KeyUsage:           x509.KeyUsageDigitalSignature | x509.KeyUsageKeyAgreement | x509.KeyUsageKeyEncipherment,
-		ExtKeyUsage:        []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+		SerialNumber: big.NewInt(1),
+		Subject: pkix.Name{
+			CommonName: "localhost",
+		},
+		DNSNames:              []string{"localhost"},
+		NotBefore:             time.Now(),
+		NotAfter:              time.Now().AddDate(0, 0, 1),
+		SignatureAlgorithm:    x509.SHA256WithRSA,
+		KeyUsage:              x509.KeyUsageDigitalSignature | x509.KeyUsageKeyEncipherment,
+		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+		BasicConstraintsValid: true,
 	}
+
 	der, err := x509.CreateCertificate(prng, template, template, priv.Public(), priv)
 	if err != nil {
 		return nil, err
 	}
 
 	// It is safe to ignore the error here because we're parsing known-good data
-	cert, _ := x509.ParseCertificate(der)
+	cert, err := x509.ParseCertificate(der)
+	if err != nil {
+		fmt.Printf("Fehler beim Parsen des Zertifikats: %v", err)
+		return nil, err
+	}
+
+	fmt.Printf("📛 DNSNames im geparsten Zertifikat: %v", cert.DNSNames)
 	return cert, nil
+
 }

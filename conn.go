@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net"
 	"reflect"
 	"sync"
@@ -19,14 +20,16 @@ type Certificate struct {
 }
 
 type PreSharedKey struct {
-	CipherSuite  CipherSuite
-	IsResumption bool
-	Identity     []byte
-	Key          []byte
-	NextProto    string
-	ReceivedAt   time.Time
-	ExpiresAt    time.Time
-	TicketAgeAdd uint32
+	CipherSuite       CipherSuite
+	IsResumption      bool
+	Identity          []byte
+	Key               []byte
+	NextProto         string
+	ReceivedAt        time.Time
+	ExpiresAt         time.Time
+	TicketAgeAdd      uint32
+	//AllowEarlyData    bool
+	//EarlyDataLifetime uint32 // Lebensdauer der 0-RTT-Daten in Sekunden
 }
 
 type PreSharedKeyCache interface {
@@ -128,6 +131,10 @@ type Config struct {
 	PSKModes         []PSKKeyExchangeMode
 	NonBlocking      bool
 	UseDTLS          bool
+
+	SupportedVersions   []TLSVersion
+	Enable0RTT          bool
+	AllowInsecureHashes bool
 
 	RecordLayer RecordLayerFactory
 
@@ -254,7 +261,8 @@ type ConnectionState struct {
 	VerifiedChains   [][]*x509.Certificate // verified chains built from PeerCertificates
 	NextProto        string                // Selected ALPN proto
 	UsingPSK         bool                  // Are we using PSK.
-	UsingEarlyData   bool                  // Did we negotiate 0-RTT.
+	UsingEarlyData   bool                  // Did we negotiate 0-RTT. M:Flag, ob 0-RTT-Daten verwendet werden
+
 }
 
 // Conn implements the net.Conn interface, as with "crypto/tls"
@@ -270,6 +278,8 @@ type Conn struct {
 	handshakeMutex    sync.Mutex
 	handshakeAlert    Alert
 	handshakeComplete bool
+	UsingEarlyData    bool   // Did we negotiate 0-RTT. M:Flag, ob 0-RTT-Daten verwendet werden
+	EarlyData         []byte // Enthält die 0-RTT-Daten, wenn sie gesendet wurden
 
 	readBuffer []byte
 	in, out    RecordLayer
@@ -467,6 +477,53 @@ func (c *Conn) Read(buffer []byte) (int, error) {
 	return readPartial(&c.readBuffer, buffer), nil
 }
 
+func (c *Conn) MaybeSendEarlyData() error {
+	if c.EarlyData != nil && c.IsEarlyDataAllowed() {
+		logf(logTypeHandshake, "🚀 [Conn] Sende 0-RTT-Daten...")
+		_, err := c.Write(c.EarlyData)
+		if err != nil {
+			logf(logTypeHandshake, "❌ Fehler beim Senden der 0-RTT-Daten: %v", err)
+			return err
+		}
+		logf(logTypeHandshake, "✅ 0-RTT-Daten wurden erfolgreich gesendet")
+		return nil
+	}
+	logf(logTypeHandshake, "⚠️ 0-RTT nicht erlaubt oder keine Daten gesetzt")
+	return nil
+}
+
+func (c *Conn) WriteEarlyData() error {
+	var epoch Epoch = 0
+	if c.hsCtx != nil && c.hsCtx.hIn != nil && c.hsCtx.hIn.conn != nil {
+		epoch = c.hsCtx.hIn.conn.Epoch()
+	}
+
+	if !c.IsEarlyDataAllowed() {
+		return fmt.Errorf("🚫 0-RTT Early Data nicht erlaubt: aktuell Epoch %d (erwartet %d)", epoch, EpochEarlyData)
+	}
+
+	fmt.Printf("📤 Sende 0-RTT Early Data (%d Bytes)...", len(c.EarlyData))
+
+	_, err := c.Write(c.EarlyData)
+	return err
+}
+
+func (c *Conn) SendEarlyData() error {
+	if len(c.EarlyData) == 0 {
+		return fmt.Errorf("Keine RTT-Daten zum senden")
+	}
+	_, err := c.Write(c.EarlyData) // Send the early data
+	return err
+}
+
+// Funktion zum Lesen von 0-RTT-Daten
+func (c *Conn) ReadEarlyData() ([]byte, error) {
+	if len(c.EarlyData) == 0 {
+		return nil, fmt.Errorf("keine 0-RTT-Daten vorhanden")
+	}
+	return c.EarlyData, nil // Gibt die 0-RTT-Daten zurück
+}
+
 // Write application data
 func (c *Conn) Write(buffer []byte) (int, error) {
 	// Lock the output channel
@@ -505,6 +562,14 @@ func (c *Conn) Write(buffer []byte) (int, error) {
 		sent += len(buffer[start:])
 	}
 	return sent, nil
+}
+
+// prüft ob 0-RTT-Daten gesendet werden können
+func (c *Conn) IsEarlyDataAllowed() bool {
+	if c.hsCtx == nil || c.hsCtx.hIn == nil || c.hsCtx.hIn.conn == nil {
+		return false
+	}
+	return c.config.Enable0RTT && c.hsCtx.hIn.conn.Epoch() == EpochEarlyData
 }
 
 // sendAlert sends a TLS alert message.
@@ -624,8 +689,17 @@ func (c *Conn) takeAction(actionGeneric HandshakeAction) Alert {
 		c.out.ResetClear(action.seq)
 
 	case StorePSK:
+		log.Printf("🚨 StorePSK wird im CLIENT aufgerufen!")
 		logf(logTypeHandshake, "%s Storing new session ticket with identity [%x]", label, action.PSK.Identity)
 		if c.isClient {
+			logf(logTypeHandshake, "DEBUG: StorePSK: isClient=%v", c.isClient)
+			logf(logTypeHandshake, "DEBUG: PSK-Details: Identity=%x AllowEarlyData=%v EarlyDataLifetime=%d ExpiresAt=%v",
+				action.PSK.Identity,
+				//action.PSK.AllowEarlyData,
+				//action.PSK.EarlyDataLifetime,
+				action.PSK.ExpiresAt,
+			)
+
 			// Clients look up PSKs based on server name
 			c.config.PSKs.Put(c.config.ServerName, action.PSK)
 		} else {
@@ -803,6 +877,8 @@ func (c *Conn) Handshake() Alert {
 						c.config.TicketLen,
 						c.config.TicketLifetime,
 						c.config.EarlyDataLifetime)
+
+					fmt.Println("🎫 Server: Sende NewSessionTicket")
 
 					for _, action := range actions {
 						alert = c.takeAction(action)

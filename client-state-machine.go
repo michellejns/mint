@@ -5,6 +5,7 @@ import (
 	"crypto"
 	"crypto/x509"
 	"hash"
+	"log"
 	"time"
 )
 
@@ -216,6 +217,10 @@ func (state clientStateStart) Next(hr handshakeMessageReader) (HandshakeState, [
 			},
 		}
 		ch.Extensions.Add(psk)
+		log.Printf("📤 CLIENT baut PSK Extension mit %d Identity(s)", len(psk.Identities))
+		for i, id := range psk.Identities {
+			log.Printf("🔑 CLIENT Identity %d: %x", i, id.Identity)
+		}
 
 		// Compute the binder key
 		h0 := params.Hash.New().Sum(nil)

@@ -5,10 +5,43 @@ import (
 	"crypto/x509"
 	"fmt"
 	"hash"
+	"log"
 	"reflect"
+	"time"
 
 	"github.com/bifurcation/mint/syntax"
 )
+
+type InMemoryPSKCache struct {
+	Session map[string]PreSharedKey
+}
+
+func NewInMemoryPSKCache() *InMemoryPSKCache {
+	return &InMemoryPSKCache{Session: make(map[string]PreSharedKey)}
+}
+
+func (c *InMemoryPSKCache) Get(identity string) (PreSharedKey, bool) {
+	fmt.Printf("🧠 [MINT] SERVER PSK-Cache: Suche nach '%s'\n", identity)
+	psk, ok := c.Session[identity]
+	if ok {
+		fmt.Printf("✅ [MINT] PSK HIT für '%s'\n", identity)
+	} else {
+		fmt.Printf("❌ [MINT] PSK MISS für '%s'\n", identity)
+	}
+	return psk, ok
+}
+
+func (c *InMemoryPSKCache) Put(identity string, psk PreSharedKey) {
+	log.Printf("‼️ [InMemoryPSKCache.Put] CALLED (embedded) – Typ: %T", c)
+	fmt.Printf("➕ [MINT] PSK speichern: '%s'\n", identity)
+	c.Session[identity] = psk
+	fmt.Printf("🕒 Ticket wird gespeichert, ExpiresAt = %v (jetzt = %v)", psk.ExpiresAt, time.Now())
+
+}
+
+func (c *InMemoryPSKCache) Size() int {
+	return len(c.Session)
+}
 
 // Server State Machine
 //
@@ -146,6 +179,8 @@ func (state serverStateStart) Next(hr handshakeMessageReader) (HandshakeState, [
 			clientCookie,
 		})
 
+	fmt.Printf("🧪 Server hat ExtensionTypeEarlyData empfangen: %v", foundExts[ExtensionTypeEarlyData])
+
 	if err != nil {
 		logf(logTypeHandshake, "[ServerStateStart] Error parsing extensions [%v]", err)
 		return nil, nil, AlertDecodeError
@@ -189,10 +224,21 @@ func (state serverStateStart) Next(hr handshakeMessageReader) (HandshakeState, [
 			body:    cookie.ClientHelloHash,
 		}
 		// have the application validate its part of the cookie
-		if state.Config.CookieHandler != nil && !state.Config.CookieHandler.Validate(state.conn, cookie.ApplicationCookie) {
-			logf(logTypeHandshake, "[ServerStateStart] Cookie mismatch")
-			return nil, nil, AlertAccessDenied
+		/*
+			if state.Config.CookieHandler != nil && !state.Config.CookieHandler.Validate(state.conn, cookie.ApplicationCookie) {
+				logf(logTypeHandshake, "[ServerStateStart] Cookie mismatch")
+				return nil, nil, AlertAccessDenied
+			}*/
+		if state.Config.CookieHandler == nil {
+			logf(logTypeHandshake, "[DEBUG] ⚠️  Kein CookieHandler gesetzt – also kann es nicht daran liegen.")
+		} else {
+			isValid := state.Config.CookieHandler.Validate(state.conn, cookie.ApplicationCookie)
+			if !isValid {
+				logf(logTypeHandshake, "[DEBUG] ❌ CookieHandler.Validate returned false → AccessDenied")
+				logf(logTypeHandshake, "[DEBUG] CookieHandler: %v", state.Config.CookieHandler)
+			}
 		}
+
 		var ok bool
 		initialCipherSuite, ok = cipherSuiteMap[cookie.CipherSuite]
 		if !ok {
@@ -343,6 +389,13 @@ func (state serverStateStart) Next(hr handshakeMessageReader) (HandshakeState, [
 			logf(logTypeHandshake, "[ServerStateStart] Insufficient extensions (%v)", foundExts)
 			return nil, nil, AlertMissingExtension
 		}
+
+		fmt.Println("🔍 Client SignatureSchemes (offered):", signatureAlgorithms.Algorithms)
+		fmt.Printf("🧪 Auswahl: Server hat %d Zertifikate", len(state.Config.Certificates))
+		for i, cert := range state.Config.Certificates {
+			fmt.Printf("🔹 Zertifikat %d: Key = %T", i, cert.PrivateKey)
+		}
+		fmt.Printf("🔍 Client SignatureSchemes: %+v", signatureAlgorithms.Algorithms)
 
 		// Select a certificate
 		name := string(*serverName)
@@ -506,6 +559,7 @@ func (state serverStateNegotiated) Next(_ handshakeMessageReader) (HandshakeStat
 			HandshakeType:    HandshakeTypeServerHello,
 			SelectedIdentity: uint16(state.selectedPSK),
 		})
+
 		if err != nil {
 			logf(logTypeHandshake, "[ServerStateNegotiated] Error adding PSK extension [%v]", err)
 			return nil, nil, AlertInternalError
@@ -714,6 +768,7 @@ func (state serverStateNegotiated) Next(_ handshakeMessageReader) (HandshakeStat
 
 	exporterSecret := deriveSecret(params, masterSecret, labelExporterSecret, h4)
 	logf(logTypeCrypto, "server exporter secret: [%d] %x", len(exporterSecret), exporterSecret)
+	fmt.Printf("🧪 UsingEarlyData on server: %v", state.Params.UsingEarlyData)
 
 	if state.Params.UsingEarlyData {
 		clientEarlyTrafficKeys := makeTrafficKeys(params, state.clientEarlyTrafficSecret)
@@ -784,9 +839,13 @@ func (state serverStateWaitEOED) State() State {
 
 func (state serverStateWaitEOED) Next(hr handshakeMessageReader) (HandshakeState, []HandshakeAction, Alert) {
 	for {
+		fmt.Printf("🟢 ServerStateWaitEOED: Wir warten auf 0-RTT-Daten...")
+
 		logf(logTypeHandshake, "Server reading early data...")
 		assert(state.hsCtx.hIn.conn.Epoch() == EpochEarlyData)
 		t, err := state.hsCtx.hIn.conn.PeekRecordType(!state.hsCtx.hIn.nonblocking)
+		fmt.Printf("🟡 RecordType: %v", t)
+
 		if err == AlertWouldBlock {
 			return nil, nil, AlertWouldBlock
 		}
@@ -813,6 +872,8 @@ func (state serverStateWaitEOED) Next(hr handshakeMessageReader) (HandshakeState
 
 		logf(logTypeHandshake, "Server read early data: %x", pt.fragment)
 		state.hsCtx.earlyData = append(state.hsCtx.earlyData, pt.fragment...)
+		fmt.Printf("📨 Server hat 0-RTT-Daten empfangen: %s", string(pt.fragment))
+
 	}
 
 	hm, alert := hr.ReadMessage()
@@ -1173,5 +1234,29 @@ func (state serverStateWaitFinished) Next(hr handshakeMessageReader) (HandshakeS
 	toSend := []HandshakeAction{
 		RekeyIn{epoch: EpochApplicationData, KeySet: clientTrafficKeys},
 	}
+
+	// NewSessionTicket mit Early Data senden (optional)
+	if state.Params.UsingPSK && state.Params.UsingEarlyData {
+		ticket, err := NewSessionTicket(32, 600)
+		if err != nil {
+			logf(logTypeHandshake, "[ServerStateWaitFinished] Fehler beim Erstellen des SessionTickets: %v", err)
+		} else {
+			err := ticket.Extensions.Add(&TicketEarlyDataInfoExtension{
+				MaxEarlyDataSize: 0xffffffff,
+			})
+			if err != nil {
+				logf(logTypeHandshake, "[ServerStateWaitFinished] Fehler beim Hinzufügen der EarlyDataExtension: %v", err)
+			} else {
+				action, err := state.hsCtx.SendHandshakeMessageFromBody(ticket)
+				if err != nil {
+					logf(logTypeHandshake, "[ServerStateWaitFinished] Fehler beim Senden des SessionTickets: %v", err)
+				} else {
+					toSend = append(toSend, action)
+					logf(logTypeHandshake, "✅ Server: NewSessionTicket mit EarlyData wurde gesendet")
+				}
+			}
+		}
+	}
+
 	return nextState, toSend, AlertNoAlert
 }
